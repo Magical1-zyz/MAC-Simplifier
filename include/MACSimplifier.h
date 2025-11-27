@@ -2,28 +2,26 @@
 #include "MathUtils.h"
 #include <vector>
 #include <string>
-#include <map>
+#include <unordered_map>
+#include <Eigen/Dense>
 
-// 前向声明 tinygltf 类型，避免在头文件中引入大库
-namespace tinygltf {
-    class Model;
-    class Mesh;
-}
+// Assimp 前向声明
+struct aiScene;
+struct aiMesh;
 
 struct Vertex {
-    Vec3 p;
+    Eigen::Vector3d p;
     Quadric q;
     int id;
+    int uniqueId;
     bool removed = false;
-    std::vector<int> neighbors; // 邻接面索引
 };
 
 struct Edge {
     int v1, v2;
     double cost;
-    Vec3 target;
+    Eigen::Vector3d target;
 
-    // 优先队列比较函数（最小堆）
     bool operator>(const Edge& other) const {
         return cost > other.cost;
     }
@@ -34,23 +32,45 @@ public:
     MACSimplifier();
     ~MACSimplifier();
 
-    // 论文参数配置
-    double w_geo;       // 几何权重 (默认 1.0)
-    double w_norm;      // 法线权重 (默认 0.1)
-    double w_uv_base;   // UV基础权重 (默认 0.1)
+    double w_geo;
+    double w_norm;
+    double w_uv_base;
+    double w_boundary;
 
-    // 数据加载与保存
-    void loadFromTinyGLTF(const tinygltf::Model& model, const tinygltf::Mesh& mesh);
-    void saveToGLTF(const std::string& filename);
-
-    // 核心算法
-    void run(double ratio);
+    // 修改：接收 Assimp 的 aiScene 指针
+    // 注意：我们会直接修改 scene 中的 mesh 数据
+    void simplify(const aiScene* scene, double ratio);
 
 private:
     std::vector<Vertex> vertices;
     std::vector<int> indices;
-    std::vector<Vec3> normals;
-    std::vector<std::pair<double, double>> uvs;
 
+    std::vector<Eigen::Vector3d> normals;
+    std::vector<Eigen::Vector2d> uvs;
+
+    struct UniqueVertex {
+        Eigen::Vector3d p;
+        Quadric q;
+        std::vector<int> originalIndices;
+        bool removed = false;
+    };
+    std::vector<UniqueVertex> uniqueVertices;
+    std::vector<int> uniqueIndices;
+
+    // 记录原始 Mesh 归属，用于回写
+    struct MeshRef {
+        aiMesh* mesh;      // 指向 Assimp Mesh 的指针
+        int baseVertexIdx; // 全局顶点偏移
+        int indexCount;    // 索引数量
+    };
+    std::vector<MeshRef> meshGroups;
+    std::unordered_map<int, int> globalFaceToMeshID;
+
+    // 辅助函数
+    void loadData(const aiScene* scene);
+    void buildUniqueTopology();
     void computeQuadrics();
+    void runSimplification(double ratio);
+    void writeBack(const aiScene* scene);
+    void clear();
 };

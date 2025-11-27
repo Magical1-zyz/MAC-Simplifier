@@ -9,22 +9,10 @@ project(MAC-Simplifier)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# --- 核心修改开始 ---
-
-# 1. 查找 tinygltf 的依赖项 nlohmann_json (vcpkg 必定会自动安装这个)
-find_package(nlohmann_json CONFIG REQUIRED)
-
-# 2. 手动查找 tinygltf 头文件路径，而不是依赖 Config 文件
-# 因为 tinygltf 是纯头文件库，找到 tiny_gltf.h 所在的目录即可
-find_path(TINYGLTF_INCLUDE_DIR NAMES tiny_gltf.h)
-
-if(NOT TINYGLTF_INCLUDE_DIR)
-    message(FATAL_ERROR "Could not find tiny_gltf.h. Please run: .\\vcpkg install tinygltf:x64-windows")
-else()
-    message(STATUS "Found tinygltf headers: ${TINYGLTF_INCLUDE_DIR}")
-endif()
-
-# --- 核心修改结束 ---
+# --- 依赖查找 ---
+# 移除 tinygltf，添加 assimp
+find_package(assimp CONFIG REQUIRED)
+find_package(Eigen3 CONFIG REQUIRED)
 
 # 添加源文件
 set(SOURCES
@@ -39,13 +27,13 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 add_executable(MACSimplifier ${SOURCES})
 
 # --- 链接库 ---
-# 1. 添加 tinygltf 的头文件路径
-target_include_directories(MACSimplifier PRIVATE ${TINYGLTF_INCLUDE_DIR})
+# 链接 Assimp 和 Eigen
+target_link_libraries(MACSimplifier PRIVATE assimp::assimp Eigen3::Eigen)
 
-# 2. 链接 nlohmann_json (tinygltf 需要它)
-target_link_libraries(MACSimplifier PRIVATE nlohmann_json::nlohmann_json)
+if(MINGW)
+    target_link_options(MACSimplifier PRIVATE -static)
+endif()
 
-# Linux/Unix 平台特定的系统库链接
 if(UNIX)
     target_link_libraries(MACSimplifier pthread dl)
 endif()

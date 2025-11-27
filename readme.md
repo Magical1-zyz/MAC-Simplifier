@@ -37,13 +37,15 @@ MAC-Simplifier/
 - **构建工具**: CMake >= 3.10
 - **包管理器**: vcpkg
 - **依赖库**:
-    - tinygltf (及其依赖 nlohmann-json, stb)
+    - assimp
+    - eigen3
 
 ### 2. 安装依赖 (使用 vcpkg)
-在构建之前，请确保已安装 vcpkg 并安装了对应架构的 tinygltf。以 Windows x64 为例：
+在构建之前，请确保已安装 vcpkg 并安装了对应架构的依赖库。以 Windows x64 为例：
 ```PowerShell
 # 在 vcpkg 目录下运行
-.\vcpkg install tinygltf:x64-windows
+.\vcpkg install assimp
+.\vcpkg install eigen3
 ```
 ### 3. 编译项目
 #### 方式 A: 使用命令行 (通用)

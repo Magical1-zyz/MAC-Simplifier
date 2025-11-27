@@ -3,354 +3,469 @@
 #include <iostream>
 #include <set>
 #include <algorithm>
-#include <cstring> // for memcpy
+#include <vector>
+#include <cmath>
 
-// 必须在某个 .cpp 文件中定义这些宏一次
-#define TINYGLTF_IMPLEMENTATION
-#define STB_IMAGE_IMPLEMENTATION
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "tiny_gltf.h"
+#include <assimp/scene.h>
+#include <assimp/mesh.h>
 
-// --- Quadric Implementation ---
+// ==========================================
+// 1. Math Helper (Eigen Wrapper)
+// ==========================================
+using Vec3 = Eigen::Vector3d;
 
-Quadric::Quadric() { std::fill(a, a + 10, 0.0); }
-
-void Quadric::setZero() { std::fill(a, a + 10, 0.0); }
-
-Quadric Quadric::operator+(const Quadric& b) const {
-    Quadric r;
-    for (int i = 0; i < 10; i++) r.a[i] = a[i] + b.a[i];
-    return r;
-}
-
-Quadric Quadric::operator*(double s) const {
-    Quadric r;
-    for (int i = 0; i < 10; i++) r.a[i] = a[i] * s;
-    return r;
-}
-
-Quadric& Quadric::operator+=(const Quadric& b) {
-    for (int i = 0; i < 10; i++) a[i] += b.a[i];
-    return *this;
-}
+// ==========================================
+// 2. Quadric Error Metric
+// ==========================================
+Quadric::Quadric() { A.setZero(); }
+void Quadric::setZero() { A.setZero(); }
+Quadric Quadric::operator+(const Quadric& b) const { Quadric r; r.A = A + b.A; return r; }
+Quadric& Quadric::operator+=(const Quadric& b) { A += b.A; return *this; }
+Quadric Quadric::operator*(double s) const { Quadric r; r.A = A * s; return r; }
 
 Quadric Quadric::FromPlane(double a, double b, double c, double d) {
     Quadric Q;
-    Q.a[0] = a * a; Q.a[1] = a * b; Q.a[2] = a * c; Q.a[3] = a * d;
-    Q.a[4] = b * b; Q.a[5] = b * c; Q.a[6] = b * d;
-    Q.a[7] = c * c; Q.a[8] = c * d;
-    Q.a[9] = d * d;
+    Eigen::Vector4d p(a, b, c, d);
+    Q.A = p * p.transpose();
     return Q;
 }
 
 Quadric Quadric::AttributePenalty(double w) {
-    Quadric Q;
-    Q.a[0] = w; Q.a[4] = w; Q.a[7] = w;
+    Quadric Q; Q.setZero();
+    Q.A(0,0) = w; Q.A(1,1) = w; Q.A(2,2) = w;
     return Q;
 }
 
 double Quadric::evaluate(const Vec3& v) const {
-    return a[0] * v.x * v.x + 2 * a[1] * v.x * v.y + 2 * a[2] * v.x * v.z + 2 * a[3] * v.x +
-           a[4] * v.y * v.y + 2 * a[5] * v.y * v.z + 2 * a[6] * v.y +
-           a[7] * v.z * v.z + 2 * a[8] * v.z +
-           a[9];
+    Eigen::Vector4d vh(v.x(), v.y(), v.z(), 1.0);
+    return vh.transpose() * A * vh;
 }
 
 bool Quadric::optimize(Vec3& result) const {
-    double A[3][3] = { {a[0], a[1], a[2]}, {a[1], a[4], a[5]}, {a[2], a[5], a[7]} };
-    double b[3] = { a[3], a[6], a[8] };
-
-    double det = A[0][0] * (A[1][1] * A[2][2] - A[1][2] * A[2][1]) -
-                 A[0][1] * (A[1][0] * A[2][2] - A[1][2] * A[2][0]) +
-                 A[0][2] * (A[1][0] * A[2][1] - A[1][1] * A[2][0]);
-
-    if (std::abs(det) < 1e-12) return false;
-
-    double invDet = 1.0 / det;
-    double A_inv[3][3];
-
-    // 手动求逆矩阵
-    A_inv[0][0] = (A[1][1] * A[2][2] - A[1][2] * A[2][1]) * invDet;
-    A_inv[0][1] = (A[0][2] * A[2][1] - A[0][1] * A[2][2]) * invDet;
-    A_inv[0][2] = (A[0][1] * A[1][2] - A[0][2] * A[1][1]) * invDet;
-
-    A_inv[1][0] = (A[1][2] * A[2][0] - A[1][0] * A[2][2]) * invDet;
-    A_inv[1][1] = (A[0][0] * A[2][2] - A[0][2] * A[2][0]) * invDet;
-    A_inv[1][2] = (A[0][2] * A[1][0] - A[0][0] * A[1][2]) * invDet;
-
-    A_inv[2][0] = (A[1][0] * A[2][1] - A[1][1] * A[2][0]) * invDet;
-    A_inv[2][1] = (A[0][1] * A[2][0] - A[0][0] * A[2][1]) * invDet;
-    A_inv[2][2] = (A[0][0] * A[1][1] - A[0][1] * A[1][0]) * invDet;
-
-    result.x = -(A_inv[0][0] * b[0] + A_inv[0][1] * b[1] + A_inv[0][2] * b[2]);
-    result.y = -(A_inv[1][0] * b[0] + A_inv[1][1] * b[1] + A_inv[1][2] * b[2]);
-    result.z = -(A_inv[2][0] * b[0] + A_inv[2][1] * b[1] + A_inv[2][2] * b[2]);
-
+    Eigen::Matrix3d M = A.block<3,3>(0,0);
+    Eigen::Vector3d b = -A.block<3,1>(0,3);
+    Eigen::LDLT<Eigen::Matrix3d> solver(M);
+    if (solver.info() != Eigen::Success || solver.rcond() < 1e-6) return false;
+    result = solver.solve(b);
     return true;
 }
 
-// --- MACSimplifier Implementation ---
+// ==========================================
+// 3. MACSimplifier Implementation
+// ==========================================
 
-MACSimplifier::MACSimplifier() : w_geo(1.0), w_norm(0.1), w_uv_base(0.1) {}
+MACSimplifier::MACSimplifier() : w_geo(1.0), w_norm(0.1), w_uv_base(0.1), w_boundary(10000.0) {}
 MACSimplifier::~MACSimplifier() {}
 
-void MACSimplifier::loadFromTinyGLTF(const tinygltf::Model& model, const tinygltf::Mesh& mesh) {
-    if (mesh.primitives.empty()) return;
-    const auto& prim = mesh.primitives[0];
+void MACSimplifier::clear() {
+    vertices.clear(); indices.clear(); normals.clear(); uvs.clear();
+    meshGroups.clear(); globalFaceToPrimID.clear();
+    uniqueVertices.clear(); uniqueIndices.clear();
+}
 
-    // Load Positions
-    if (prim.attributes.count("POSITION")) {
-        const auto& accessor = model.accessors[prim.attributes.at("POSITION")];
-        const auto& bufferView = model.bufferViews[accessor.bufferView];
-        const auto& buffer = model.buffers[bufferView.buffer];
-        const float* data = reinterpret_cast<const float*>(&buffer.data[bufferView.byteOffset + accessor.byteOffset]);
+// --- 唯一性 Key ---
+struct AttributeVertexKey {
+    int64_t px, py, pz;
+    int64_t nx, ny, nz;
+    int64_t u, v;
 
-        for (size_t i = 0; i < accessor.count; ++i) {
+    bool operator<(const AttributeVertexKey& o) const {
+        if (px != o.px) return px < o.px;
+        if (py != o.py) return py < o.py;
+        if (pz != o.pz) return pz < o.pz;
+        if (nx != o.nx) return nx < o.nx;
+        if (ny != o.ny) return ny < o.ny;
+        if (nz != o.nz) return nz < o.nz;
+        if (u != o.u) return u < o.u;
+        return v < o.v;
+    }
+};
+
+AttributeVertexKey make_key(const Vertex& v, const Vec3& n, const Eigen::Vector2d& uv) {
+    const double posScale = 10000.0;
+    const double normScale = 100.0;
+    const double uvScale = 4096.0;
+
+    return {
+            (int64_t)std::round(v.p.x() * posScale), (int64_t)std::round(v.p.y() * posScale), (int64_t)std::round(v.p.z() * posScale),
+            (int64_t)std::round(n.x() * normScale),  (int64_t)std::round(n.y() * normScale),  (int64_t)std::round(n.z() * normScale),
+            (int64_t)std::round(uv.x() * uvScale),   (int64_t)std::round(uv.y() * uvScale)
+    };
+}
+
+void MACSimplifier::simplify(const aiScene* scene, double ratio) {
+    clear();
+    if (!scene) return;
+
+    std::cout << "[Info] Loading data from Assimp Scene..." << std::endl;
+    loadData(scene);
+
+    if (indices.empty()) {
+        std::cout << "[Warn] No geometry found." << std::endl;
+        return;
+    }
+
+    buildUniqueTopology();
+    runSimplification(ratio);
+    writeBack(scene);
+}
+
+void MACSimplifier::loadData(const aiScene* scene) {
+    int globalOffset = 0;
+
+    // 遍历所有 Mesh
+    // Assimp 的 PreTransformVertices 步骤已经把 Node 的变换应用到 Mesh 顶点了
+    // 所以这里我们可以直接读取 Mesh，它们已经在世界坐标系中了
+    for (unsigned int m = 0; m < scene->mNumMeshes; ++m) {
+        aiMesh* mesh = scene->mMeshes[m];
+        if (mesh->mPrimitiveTypes != aiPrimitiveType_TRIANGLE) continue;
+
+        MeshRef ref;
+        ref.mesh = mesh;
+        ref.baseVertexIdx = globalOffset;
+
+        // 读取顶点
+        for (unsigned int i = 0; i < mesh->mNumVertices; ++i) {
             Vertex v;
-            v.p = Vec3(data[i * 3], data[i * 3 + 1], data[i * 3 + 2]);
-            v.id = (int)i;
+            v.id = i;
+            // aiVector3D -> Eigen::Vector3d
+            v.p = Vec3(mesh->mVertices[i].x, mesh->mVertices[i].y, mesh->mVertices[i].z);
             vertices.push_back(v);
+
+            // Normals
+            if (mesh->HasNormals()) {
+                normals.push_back(Vec3(mesh->mNormals[i].x, mesh->mNormals[i].y, mesh->mNormals[i].z).normalized());
+            } else {
+                normals.push_back(Vec3(0, 1, 0));
+            }
+
+            // UVs (Channel 0)
+            if (mesh->HasTextureCoords(0)) {
+                uvs.push_back(Eigen::Vector2d(mesh->mTextureCoords[0][i].x, mesh->mTextureCoords[0][i].y));
+            } else {
+                uvs.push_back(Eigen::Vector2d(0, 0));
+            }
         }
+
+        // 读取索引 (Faces)
+        int localIndexCount = 0;
+        for (unsigned int i = 0; i < mesh->mNumFaces; ++i) {
+            const aiFace& face = mesh->mFaces[i];
+            if (face.mNumIndices != 3) continue;
+
+            indices.push_back(face.mIndices[0] + globalOffset);
+            indices.push_back(face.mIndices[1] + globalOffset);
+            indices.push_back(face.mIndices[2] + globalOffset);
+            localIndexCount += 3;
+        }
+
+        // 记录面归属
+        size_t numNewFaces = localIndexCount / 3;
+        size_t startFace = indices.size() / 3 - numNewFaces;
+        for (size_t i = 0; i < numNewFaces; ++i) {
+            globalFaceToPrimID[startFace + i] = meshGroups.size();
+        }
+
+        ref.indexCount = localIndexCount;
+        meshGroups.push_back(ref);
+        globalOffset += mesh->mNumVertices;
+    }
+}
+
+void MACSimplifier::buildUniqueTopology() {
+    std::cout << "[Info] Building topology (Preserving Seams)..." << std::endl;
+
+    std::map<AttributeVertexKey, int> keyMap;
+    uniqueVertices.clear();
+    uniqueIndices.resize(indices.size());
+
+    for (size_t i = 0; i < vertices.size(); ++i) {
+        AttributeVertexKey key = make_key(vertices[i], normals[i], uvs[i]);
+
+        int uid = -1;
+        auto it = keyMap.find(key);
+        if (it != keyMap.end()) {
+            uid = it->second;
+        } else {
+            uid = (int)uniqueVertices.size();
+            UniqueVertex uv_struct;
+            uv_struct.p = vertices[i].p;
+            uv_struct.q.setZero();
+            uniqueVertices.push_back(uv_struct);
+            keyMap[key] = uid;
+        }
+
+        vertices[i].uniqueId = uid;
+        uniqueVertices[uid].originalIndices.push_back(i);
     }
 
-    // Load Normals
-    if (prim.attributes.count("NORMAL")) {
-        const auto& accessor = model.accessors[prim.attributes.at("NORMAL")];
-        const auto& bufferView = model.bufferViews[accessor.bufferView];
-        const auto& buffer = model.buffers[bufferView.buffer];
-        const float* data = reinterpret_cast<const float*>(&buffer.data[bufferView.byteOffset + accessor.byteOffset]);
-        for (size_t i = 0; i < accessor.count; ++i) {
-            normals.push_back(Vec3(data[i * 3], data[i * 3 + 1], data[i * 3 + 2]));
-        }
-    } else {
-        normals.resize(vertices.size(), Vec3(0, 1, 0));
+    for (size_t i = 0; i < indices.size(); ++i) {
+        uniqueIndices[i] = vertices[indices[i]].uniqueId;
     }
 
-    // Load UVs
-    if (prim.attributes.count("TEXCOORD_0")) {
-        const auto& accessor = model.accessors[prim.attributes.at("TEXCOORD_0")];
-        const auto& bufferView = model.bufferViews[accessor.bufferView];
-        const auto& buffer = model.buffers[bufferView.buffer];
-        const float* data = reinterpret_cast<const float*>(&buffer.data[bufferView.byteOffset + accessor.byteOffset]);
-        for (size_t i = 0; i < accessor.count; ++i) {
-            uvs.push_back({ data[i * 2], data[i * 2 + 1] });
-        }
-    } else {
-        uvs.resize(vertices.size(), { 0.0, 0.0 });
-    }
-
-    // Load Indices
-    if (prim.indices >= 0) {
-        const auto& accessor = model.accessors[prim.indices];
-        const auto& bufferView = model.bufferViews[accessor.bufferView];
-        const auto& buffer = model.buffers[bufferView.buffer];
-
-        if (accessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) {
-            const unsigned short* data = reinterpret_cast<const unsigned short*>(&buffer.data[bufferView.byteOffset + accessor.byteOffset]);
-            for (size_t i = 0; i < accessor.count; ++i) indices.push_back(data[i]);
-        } else if (accessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT) {
-            const unsigned int* data = reinterpret_cast<const unsigned int*>(&buffer.data[bufferView.byteOffset + accessor.byteOffset]);
-            for (size_t i = 0; i < accessor.count; ++i) indices.push_back(data[i]);
-        }
-    }
+    std::cout << "[Info] Topology built. Unique Vertices: " << uniqueVertices.size() << std::endl;
 }
 
 void MACSimplifier::computeQuadrics() {
-    std::cout << "[Info] Computing Quadrics..." << std::endl;
+    int numFaces = uniqueIndices.size() / 3;
+    std::map<std::pair<int, int>, int> edgeCounts;
 
-    // UV Adaptive Weight Calculation (Paper 1.1.1.2)
-    double u_min = 1e9, u_max = -1e9, v_min = 1e9, v_max = -1e9;
-    for (const auto& uv : uvs) {
-        if (uv.first < u_min) u_min = uv.first;
-        if (uv.first > u_max) u_max = uv.first;
-        if (uv.second < v_min) v_min = uv.second;
-        if (uv.second > v_max) v_max = uv.second;
-    }
-    double uv_span = std::max(u_max - u_min, v_max - v_min);
-    double uv_scale_factor = (uv_span > 1e-6) ? (1.0 / uv_span) : 1.0;
-    double w_uv_adaptive = w_uv_base * uv_scale_factor;
-
-    std::cout << "[Info] Adaptive UV Weight: " << w_uv_adaptive << " (Scale Factor: " << uv_scale_factor << ")" << std::endl;
-
-    for (auto& v : vertices) {
-        v.q.setZero();
-        v.q += Quadric::AttributePenalty(w_norm);
-        v.q += Quadric::AttributePenalty(w_uv_adaptive);
-    }
-
-    int numFaces = indices.size() / 3;
     for (int i = 0; i < numFaces; ++i) {
-        int i0 = indices[i * 3];
-        int i1 = indices[i * 3 + 1];
-        int i2 = indices[i * 3 + 2];
+        int i0 = uniqueIndices[i * 3];
+        int i1 = uniqueIndices[i * 3 + 1];
+        int i2 = uniqueIndices[i * 3 + 2];
+        if (i0 == i1 || i1 == i2 || i2 == i0) continue;
 
-        Vec3 p0 = vertices[i0].p;
-        Vec3 p1 = vertices[i1].p;
-        Vec3 p2 = vertices[i2].p;
-
-        Vec3 n = (p1 - p0).cross(p2 - p0).normalize();
+        Vec3 p0 = uniqueVertices[i0].p;
+        Vec3 p1 = uniqueVertices[i1].p;
+        Vec3 p2 = uniqueVertices[i2].p;
+        Vec3 n = (p1 - p0).cross(p2 - p0).normalized();
         double d = -n.dot(p0);
 
-        Quadric Kp = Quadric::FromPlane(n.x, n.y, n.z, d);
+        Quadric Kp = Quadric::FromPlane(n.x(), n.y(), n.z(), d);
         Kp = Kp * w_geo;
 
-        vertices[i0].q += Kp;
-        vertices[i1].q += Kp;
-        vertices[i2].q += Kp;
+        uniqueVertices[i0].q += Kp;
+        uniqueVertices[i1].q += Kp;
+        uniqueVertices[i2].q += Kp;
 
-        vertices[i0].neighbors.push_back(i);
-        vertices[i1].neighbors.push_back(i);
-        vertices[i2].neighbors.push_back(i);
+        int e[3][2] = {{i0,i1}, {i1,i2}, {i2,i0}};
+        for(auto& edge : e) {
+            int u=edge[0], v=edge[1];
+            if(u>v) std::swap(u,v);
+            edgeCounts[{u,v}]++;
+        }
     }
+
+    for(auto& uv : uniqueVertices) uv.q += Quadric::AttributePenalty(0.001);
+
+    int protectedEdges = 0;
+    for (int i = 0; i < numFaces; ++i) {
+        int idx[3] = {uniqueIndices[i*3], uniqueIndices[i*3+1], uniqueIndices[i*3+2]};
+        if (idx[0] == idx[1] || idx[1] == idx[2] || idx[2] == idx[0]) continue;
+
+        Vec3 p[3] = {uniqueVertices[idx[0]].p, uniqueVertices[idx[1]].p, uniqueVertices[idx[2]].p};
+        Vec3 n = (p[1]-p[0]).cross(p[2]-p[0]).normalized();
+
+        for(int j=0; j<3; ++j) {
+            int u = idx[j];
+            int v = idx[(j+1)%3];
+            int u_s = u, v_s = v;
+            if(u_s > v_s) std::swap(u_s, v_s);
+
+            if(edgeCounts[{u_s, v_s}] == 1) {
+                Vec3 edgeVec = uniqueVertices[v].p - uniqueVertices[u].p;
+                Vec3 borderN = edgeVec.cross(n).normalized();
+                double d = -borderN.dot(uniqueVertices[u].p);
+
+                Quadric Qborder = Quadric::FromPlane(borderN.x(), borderN.y(), borderN.z(), d) * w_boundary;
+                uniqueVertices[u].q += Qborder;
+                uniqueVertices[v].q += Qborder;
+                protectedEdges++;
+            }
+        }
+    }
+    std::cout << "[Info] Protected Edges (Seams): " << protectedEdges << std::endl;
 }
 
-void MACSimplifier::run(double ratio) {
+void MACSimplifier::runSimplification(double ratio) {
     if (indices.empty()) return;
+
+    std::vector<std::vector<int>> vertFaces(uniqueVertices.size());
+    int numFaces = uniqueIndices.size() / 3;
+    for(int i=0; i<numFaces; ++i) {
+        int i0=uniqueIndices[i*3], i1=uniqueIndices[i*3+1], i2=uniqueIndices[i*3+2];
+        if(i0==i1||i1==i2||i2==i0) continue;
+        vertFaces[i0].push_back(i); vertFaces[i1].push_back(i); vertFaces[i2].push_back(i);
+    }
 
     computeQuadrics();
 
-    std::cout << "[Info] Building Edges..." << std::endl;
     std::vector<Edge*> heap;
     std::set<std::pair<int, int>> edgeSet;
-    int numFaces = indices.size() / 3;
 
-    for (int i = 0; i < numFaces; ++i) {
-        for (int j = 0; j < 3; ++j) {
-            int v1 = indices[i * 3 + j];
-            int v2 = indices[i * 3 + (j + 1) % 3];
-            if (v1 > v2) std::swap(v1, v2);
-            if (edgeSet.find({ v1, v2 }) == edgeSet.end()) {
-                edgeSet.insert({ v1, v2 });
+    auto calc_cost = [&](int v1, int v2, const Quadric& Q, Vec3& target) -> double {
+        double min_cost = 1e18;
+        Vec3 p_opt;
+        if (Q.optimize(p_opt)) {
+            min_cost = Q.evaluate(p_opt);
+            target = p_opt;
+        }
+        Vec3 p_mid = (uniqueVertices[v1].p + uniqueVertices[v2].p) * 0.5;
+        double c_mid = Q.evaluate(p_mid);
+        if (c_mid < min_cost) { min_cost = c_mid; target = p_mid; }
 
-                Edge* e = new Edge();
-                e->v1 = v1; e->v2 = v2;
+        double c_v1 = Q.evaluate(uniqueVertices[v1].p);
+        if (c_v1 < min_cost) { min_cost = c_v1; target = uniqueVertices[v1].p; }
 
-                Quadric Qbar = vertices[v1].q + vertices[v2].q;
-                if (Qbar.optimize(e->target)) {
-                    e->cost = Qbar.evaluate(e->target);
-                } else {
-                    Vec3 mp = (vertices[v1].p + vertices[v2].p) * 0.5;
-                    e->cost = Qbar.evaluate(mp);
-                    e->target = mp;
-                }
+        double c_v2 = Q.evaluate(uniqueVertices[v2].p);
+        if (c_v2 < min_cost) { min_cost = c_v2; target = uniqueVertices[v2].p; }
+        return min_cost;
+    };
+
+    for(int i=0; i<numFaces; ++i) {
+        int idx[3] = {uniqueIndices[i*3], uniqueIndices[i*3+1], uniqueIndices[i*3+2]};
+        if(idx[0]==idx[1]||idx[1]==idx[2]||idx[2]==idx[0]) continue;
+        for(int j=0; j<3; ++j) {
+            int v1=idx[j], v2=idx[(j+1)%3];
+            if(v1>v2) std::swap(v1,v2);
+            if(edgeSet.find({v1,v2}) == edgeSet.end()) {
+                edgeSet.insert({v1,v2});
+                Edge* e = new Edge(); e->v1=v1; e->v2=v2;
+                Quadric Qbar = uniqueVertices[v1].q + uniqueVertices[v2].q;
+                e->cost = calc_cost(v1, v2, Qbar, e->target);
                 heap.push_back(e);
             }
         }
     }
-
-    std::make_heap(heap.begin(), heap.end(), [](Edge* a, Edge* b) { return a->cost > b->cost; });
+    std::make_heap(heap.begin(), heap.end(), [](Edge* a, Edge* b){ return a->cost > b->cost; });
 
     int targetFaces = (int)(numFaces * (1.0 - ratio));
     if (targetFaces < 4) targetFaces = 4;
     int currentFaces = numFaces;
 
-    std::cout << "[Info] Start Collapse. Target Faces: " << targetFaces << std::endl;
+    std::vector<int> map(uniqueVertices.size());
+    for(size_t i=0; i<map.size(); ++i) map[i]=i;
+    auto get_root = [&](int id) { while(id!=map[id]){ map[id]=map[map[id]]; id=map[id]; } return id; };
 
-    std::vector<int> map(vertices.size());
-    for (size_t i = 0; i < vertices.size(); ++i) map[i] = i;
-
-    auto get_root = [&](int id) {
-        while (id != map[id]) { map[id] = map[map[id]]; id = map[id]; }
-        return id;
-    };
-
-    while (currentFaces > targetFaces && !heap.empty()) {
-        std::pop_heap(heap.begin(), heap.end(), [](Edge* a, Edge* b) { return a->cost > b->cost; });
-        Edge* e = heap.back();
-        heap.pop_back();
+    while(currentFaces > targetFaces && !heap.empty()) {
+        std::pop_heap(heap.begin(), heap.end(), [](Edge* a, Edge* b){ return a->cost > b->cost; });
+        Edge* e = heap.back(); heap.pop_back();
 
         int r1 = get_root(e->v1);
         int r2 = get_root(e->v2);
+        if(r1==r2 || uniqueVertices[r1].removed || uniqueVertices[r2].removed) { delete e; continue; }
 
-        if (r1 == r2 || vertices[r1].removed || vertices[r2].removed) {
-            delete e;
-            continue;
+        bool flip = false;
+        auto check_flip_vert = [&](int u) {
+            for(int fid : vertFaces[u]) {
+                int i0=get_root(uniqueIndices[fid*3]), i1=get_root(uniqueIndices[fid*3+1]), i2=get_root(uniqueIndices[fid*3+2]);
+                if(i0==i1||i1==i2||i2==i0) continue;
+                if(i0==r1||i1==r1||i2==r1) if(i0==r2||i1==r2||i2==r2) continue;
+
+                Vec3 p0=uniqueVertices[i0].p, p1=uniqueVertices[i1].p, p2=uniqueVertices[i2].p;
+                Vec3 n_old = (p1-p0).cross(p2-p0).normalized();
+
+                if(i0==u) p0=e->target; else if(i1==u) p1=e->target; else if(i2==u) p2=e->target;
+                Vec3 n_new = (p1-p0).cross(p2-p0).normalized();
+
+                if(n_old.dot(n_new) < 0.2) return true;
+            }
+            return false;
+        };
+        if(check_flip_vert(r1) || check_flip_vert(r2)) flip = true;
+
+        if(!flip) {
+            uniqueVertices[r1].p = e->target;
+            uniqueVertices[r1].q += uniqueVertices[r2].q;
+            uniqueVertices[r2].removed = true;
+            map[r2] = r1;
+            if(vertFaces[r1].size() < 200) vertFaces[r1].insert(vertFaces[r1].end(), vertFaces[r2].begin(), vertFaces[r2].end());
+            currentFaces -= 2;
         }
-
-        vertices[r1].p = e->target;
-        vertices[r1].q += vertices[r2].q;
-        vertices[r2].removed = true;
-        map[r2] = r1;
-
-        currentFaces -= 2;
         delete e;
     }
 
-    // Rebuild Indices
-    std::vector<int> newIndices;
-    for (int i = 0; i < numFaces; ++i) {
-        int v0 = get_root(indices[i * 3]);
-        int v1 = get_root(indices[i * 3 + 1]);
-        int v2 = get_root(indices[i * 3 + 2]);
-
-        if (v0 != v1 && v1 != v2 && v2 != v0) {
-            newIndices.push_back(v0);
-            newIndices.push_back(v1);
-            newIndices.push_back(v2);
+    for(size_t i=0; i<uniqueVertices.size(); ++i) {
+        int root = get_root(i);
+        Vec3 pos = uniqueVertices[root].p;
+        for(int oldIdx : uniqueVertices[i].originalIndices) {
+            vertices[oldIdx].p = pos;
         }
     }
-    indices = newIndices;
-    std::cout << "[Info] Simplification Done. Final Faces: " << indices.size() / 3 << std::endl;
+    for(auto e: heap) delete e;
 }
 
-void MACSimplifier::saveToGLTF(const std::string& filename) {
-    tinygltf::Model model;
-    tinygltf::Scene scene;
-    tinygltf::Node node;
-    tinygltf::Mesh mesh;
-    tinygltf::Primitive primitive;
+void MACSimplifier::writeBack(const aiScene* scene) {
+    std::cout << "[Info] Writing back to Assimp structures..." << std::endl;
 
-    std::vector<float> posBuffer;
-    std::vector<unsigned int> indBuffer;
-    std::map<int, int> oldToNewMap;
-    int newCount = 0;
+    int currentFaceIdx = 0;
 
-    for (int idx : indices) {
-        if (oldToNewMap.find(idx) == oldToNewMap.end()) {
-            oldToNewMap[idx] = newCount;
-            posBuffer.push_back((float)vertices[idx].p.x);
-            posBuffer.push_back((float)vertices[idx].p.y);
-            posBuffer.push_back((float)vertices[idx].p.z);
-            newCount++;
+    // 我们必须将数据写回原来的 aiMesh 结构中
+    // 由于 Assimp 的数据在堆上，我们需要 delete[] 旧数组并 new[] 新数组
+    for (int g = 0; g < meshGroups.size(); ++g) {
+        MeshRef& ref = meshGroups[g];
+        aiMesh* mesh = ref.mesh;
+        int origFaceCount = ref.indexCount / 3;
+
+        std::vector<Vec3> newPos;
+        std::vector<Vec3> newNorm;
+        std::vector<Eigen::Vector2d> newUV;
+        std::vector<unsigned int> newInd;
+        std::unordered_map<int, int> vertMap;
+        int vertCounter = 0;
+
+        for (int k = 0; k < origFaceCount; ++k) {
+            int globalF = currentFaceIdx + k;
+            if (globalF * 3 + 2 >= indices.size()) continue;
+
+            // 检查退化面 (通过顶点ID是否相同判断)
+            // 注意: indices 里的 ID 是 vertices 的索引，而 vertices 位置已经更新
+            // 但 indices 里的值本身并没有在 runSimplification 后被重新排列(除了变-1?)
+            // 不，runSimplification 只更新了 map 和 uniqueVertices。
+            // 我们需要用 vertices 的最新位置来判断是否退化
+
+            int i0 = indices[globalF * 3];
+            int i1 = indices[globalF * 3 + 1];
+            int i2 = indices[globalF * 3 + 2];
+
+            Vec3 p0 = vertices[i0].p;
+            Vec3 p1 = vertices[i1].p;
+            Vec3 p2 = vertices[i2].p;
+
+            // 如果三角形面积接近0，则丢弃
+            if ((p1 - p0).cross(p2 - p0).norm() < 1e-9) continue;
+
+            int v[3] = { i0, i1, i2 };
+            for (int i = 0; i < 3; ++i) {
+                int gid = v[i];
+                if (vertMap.find(gid) == vertMap.end()) {
+                    vertMap[gid] = vertCounter++;
+                    newPos.push_back(vertices[gid].p);
+                    newNorm.push_back(normals[gid]); // 法线保持原样 (简单处理)
+                    newUV.push_back(uvs[gid]);
+                }
+                newInd.push_back(vertMap[gid]);
+            }
         }
-        indBuffer.push_back(oldToNewMap[idx]);
+        currentFaceIdx += origFaceCount;
+
+        // --- 更新 aiMesh ---
+
+        // 1. 清理旧数据
+        delete[] mesh->mVertices; mesh->mVertices = nullptr;
+        delete[] mesh->mNormals; mesh->mNormals = nullptr;
+        if (mesh->mTextureCoords[0]) {
+            delete[] mesh->mTextureCoords[0]; mesh->mTextureCoords[0] = nullptr;
+        }
+        delete[] mesh->mFaces; mesh->mFaces = nullptr;
+
+        // 2. 分配新数据
+        mesh->mNumVertices = newPos.size();
+        mesh->mNumFaces = newInd.size() / 3;
+
+        if (mesh->mNumVertices > 0) {
+            mesh->mVertices = new aiVector3D[mesh->mNumVertices];
+            mesh->mNormals = new aiVector3D[mesh->mNumVertices];
+            if (!newUV.empty()) mesh->mTextureCoords[0] = new aiVector3D[mesh->mNumVertices];
+
+            for (unsigned int i = 0; i < mesh->mNumVertices; ++i) {
+                mesh->mVertices[i] = aiVector3D(newPos[i].x(), newPos[i].y(), newPos[i].z());
+                mesh->mNormals[i] = aiVector3D(newNorm[i].x(), newNorm[i].y(), newNorm[i].z());
+                if (!newUV.empty()) {
+                    mesh->mTextureCoords[0][i] = aiVector3D(newUV[i].x(), newUV[i].y(), 0.0f);
+                }
+            }
+
+            mesh->mFaces = new aiFace[mesh->mNumFaces];
+            for (unsigned int i = 0; i < mesh->mNumFaces; ++i) {
+                aiFace& face = mesh->mFaces[i];
+                face.mNumIndices = 3;
+                face.mIndices = new unsigned int[3];
+                face.mIndices[0] = newInd[i * 3 + 0];
+                face.mIndices[1] = newInd[i * 3 + 1];
+                face.mIndices[2] = newInd[i * 3 + 2];
+            }
+        }
     }
-
-    tinygltf::Buffer buffer;
-    size_t posSize = posBuffer.size() * sizeof(float);
-    size_t indSize = indBuffer.size() * sizeof(unsigned int);
-    buffer.data.resize(posSize + indSize);
-    memcpy(buffer.data.data(), posBuffer.data(), posSize);
-    memcpy(buffer.data.data() + posSize, indBuffer.data(), indSize);
-    model.buffers.push_back(buffer);
-
-    tinygltf::BufferView posView;
-    posView.buffer = 0; posView.byteOffset = 0; posView.byteLength = posSize; posView.target = TINYGLTF_TARGET_ARRAY_BUFFER;
-    model.bufferViews.push_back(posView);
-
-    tinygltf::BufferView indView;
-    indView.buffer = 0; indView.byteOffset = posSize; indView.byteLength = indSize; indView.target = TINYGLTF_TARGET_ELEMENT_ARRAY_BUFFER;
-    model.bufferViews.push_back(indView);
-
-    tinygltf::Accessor posAcc;
-    posAcc.bufferView = 0; posAcc.componentType = TINYGLTF_COMPONENT_TYPE_FLOAT;
-    posAcc.count = newCount; posAcc.type = TINYGLTF_TYPE_VEC3;
-    posAcc.maxValues = { 1000.0, 1000.0, 1000.0 }; posAcc.minValues = { -1000.0, -1000.0, -1000.0 };
-    model.accessors.push_back(posAcc);
-
-    tinygltf::Accessor indAcc;
-    indAcc.bufferView = 1; indAcc.componentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT;
-    indAcc.count = indBuffer.size(); indAcc.type = TINYGLTF_TYPE_SCALAR;
-    model.accessors.push_back(indAcc);
-
-    primitive.attributes["POSITION"] = 0;
-    primitive.indices = 1;
-    primitive.mode = TINYGLTF_MODE_TRIANGLES;
-    mesh.primitives.push_back(primitive);
-    model.meshes.push_back(mesh);
-
-    node.mesh = 0; model.nodes.push_back(node); scene.nodes.push_back(0); model.scenes.push_back(scene); model.defaultScene = 0;
-
-    tinygltf::TinyGLTF loader;
-    loader.WriteGltfSceneToFile(&model, filename, true, true, true, false);
 }
